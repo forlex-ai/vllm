@@ -304,7 +304,7 @@ data.
     environment = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "GIT_NO_LAZY_FETCH": "1",
-        "LANG": "C.UTF-8"
+        "LANG": "C.UTF-8",
     }
     command = ["git", "--no-replace-objects", "-C", str(repo)]
 
@@ -312,11 +312,13 @@ data.
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise SecretScanRefusal("source enumeration timeout")
-        result = subprocess.run(command + list(args),
-                                capture_output=True,
-                                timeout=min(60, remaining),
-                                env=environment,
-                                check=False)
+        result = subprocess.run(
+            command + list(args),
+            capture_output=True,
+            timeout=min(60, remaining),
+            env=environment,
+            check=False,
+        )
         if result.returncode or len(result.stdout) > 256 * 1024 * 1024:
             raise SecretScanRefusal("incomplete Git object enumeration")
         return result.stdout
@@ -393,9 +395,8 @@ data.
         for row in git("for-each-ref", "--format=%(objectname) %(objecttype)",
                        "refs/tags").splitlines():
             fields = row.decode("ascii").split()
-            if len(fields) != 2 or not is_sha(fields[0]) or fields[1] not in {
-                    "tag", "commit", "tree", "blob"
-            }:
+            if (len(fields) != 2 or not is_sha(fields[0])
+                    or fields[1] not in {"tag", "commit", "tree", "blob"}):
                 raise SecretScanRefusal("invalid tag reference")
             references.append(fields)
         if tag_object is not None:
@@ -423,8 +424,8 @@ data.
                     })
                 headers = git("cat-file", "tag",
                               object_id).partition(b"\n\n")[0].splitlines()
-                if len(headers) < 3 or not headers[0].startswith(
-                        b"object ") or not headers[1].startswith(b"type "):
+                if (len(headers) < 3 or not headers[0].startswith(b"object ")
+                        or not headers[1].startswith(b"type ")):
                     raise SecretScanRefusal("invalid annotated tag object")
                 object_id, kind = headers[0][7:].decode(
                     "ascii"), headers[1][5:].decode("ascii")
@@ -444,13 +445,15 @@ data.
     total = 0
     with request.open("rb") as stdin, (
             directory.parent / "git-object-errors").open("wb") as stderr:
-        process = subprocess.Popen(command + ["cat-file", "--batch"],
-                                   stdin=stdin,
-                                   stdout=subprocess.PIPE,
-                                   stderr=stderr,
-                                   env=environment)
+        process = subprocess.Popen(
+            command + ["cat-file", "--batch"],
+            stdin=stdin,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            env=environment,
+        )
         try:
-            for (kind, object_id), (path, _) in objects:
+            for (kind, object_id), (path, sources) in objects:
                 header = process.stdout.readline(200)
                 fields = header.rstrip(b"\n").split()
                 if (len(fields) != 3 or fields[:2]
@@ -465,6 +468,19 @@ data.
                 with path.open("wb") as output:
                     os.chmod(path, 0o600)
                     remaining = size
+                    if kind == "blob":
+                        if time.monotonic() >= deadline:
+                            raise SecretScanRefusal(
+                                "source extraction timeout")
+                        prefix = process.stdout.read(min(512, remaining))
+                        if len(prefix) != min(512, remaining):
+                            raise SecretScanRefusal("truncated Git object")
+                        if unsupported_archive(prefix, sources):
+                            raise SecretScanRefusal(
+                                'archive or compressed blob '
+                                'requires separate qualification')
+                        output.write(prefix)
+                        remaining -= len(prefix)
                     while remaining:
                         if time.monotonic() >= deadline:
                             raise SecretScanRefusal(
@@ -492,24 +508,34 @@ data.
 
 
 def validate_diagnostics(path):
-    """Refuse source/detector errors even when the native scanner exits zero.
+    """Refuse unknown or incomplete diagnostics even when native exits zero.
+
+    Returns:
+        Raw verified/unverified finding totals from the exact completion
+        record.
 
     Raises:
-        SecretScanRefusal: Malformed, unknown, warning, or error diagnostics.
+        SecretScanRefusal: Unknown schemas, skipped-source logs or resource
+        bounds.
     """
     if path.stat().st_size > DIAGNOSTIC_LIMIT:
         raise SecretScanRefusal("scanner diagnostic limit exceeded")
+    expected = ("running source", "finished scanning")
+    seen = 0
     with path.open() as stream:
         for line in stream:
             row = strict_json(line)
-            if (not isinstance(row, dict)
-                    or not isinstance(row.get("level"), str)
-                    or row["level"] not in {
-                        "info", "info-0", "info-1", "info-2", "info-3",
-                        "info-4", "info-5", "debug"
-                    }):
+            if seen >= len(expected) or not valid_lifecycle_diagnostic(
+                    row) or row["msg"] != expected[seen]:
                 raise SecretScanRefusal(
                     "scanner reported incomplete detection")
+            seen += 1
+    if seen != len(expected):
+        raise SecretScanRefusal("scanner reported incomplete detection")
+    return {
+        "verified": row["verified_secrets"],
+        "unverified": row["unverified_secrets"]
+    }
 
 
 def run_bounded_scanner(command,
@@ -678,7 +704,7 @@ output.
         "head": head,
         "base": base,
         "result": "error",
-        "findings": []
+        "findings": [],
     }
     try:
         if tag_object is not None:
@@ -701,8 +727,8 @@ output.
                                        base,
                                        full_if_nonforward=full_if_nonforward)
         if merge is not None:
-            if not isinstance(merge, str) or not is_sha(
-                    merge) or base is None or tag_object is not None:
+            if (not isinstance(merge, str) or not is_sha(merge) or base is None
+                    or tag_object is not None):
                 raise SecretScanRefusal("invalid prospective merge source")
             parents = source_git(repo, "rev-list", "--parents", "-n", "1",
                                  merge).decode("ascii").split()
@@ -758,21 +784,44 @@ output.
             environment = {
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "HOME": str(directory),
-                "LANG": "C.UTF-8"
+                "LANG": "C.UTF-8",
             }
             output, errors = directory / "raw.jsonl", directory / "stderr"
             code = run_bounded_scanner(command, environment, output, errors,
                                        deadline)
             if code != 0:
                 raise SecretScanRefusal("scanner execution failed")
-            validate_diagnostics(errors)
+            expected_counts = validate_diagnostics(errors)
             if output.stat().st_size > OUTPUT_LIMIT:
                 raise SecretScanRefusal("scanner output limit exceeded")
+            raw_counts = {"verified": 0, "unverified": 0}
+            with output.open() as stream:
+                for line in stream:
+                    if time.monotonic() >= deadline:
+                        raise SecretScanRefusal(
+                            "scanner output validation timeout")
+                    if len(line) > 8 * 1024 * 1024 or not line.strip():
+                        raise SecretScanRefusal("invalid scanner stream")
+                    row = strict_json(line)
+                    if not isinstance(row, dict) or not isinstance(
+                            row.get("Verified"), bool):
+                        raise SecretScanRefusal(
+                            "invalid raw detection verification state")
+                    # Pinned engine metrics count raw dispatched JSON rows
+                    # before association expansion.
+                    raw_counts[
+                        "verified" if row["Verified"] else "unverified"] += 1
+            if raw_counts != expected_counts:
+                raise SecretScanRefusal(
+                    "scanner finding output does not match completion metrics")
+            # Stream the same private, completed file again; no raw rows are
+            # retained in memory.
             blocked, suppressed = 0, 0
             with output.open() as stream:
                 for line in stream:
-                    if len(line) > 8 * 1024 * 1024 or not line.strip():
-                        raise SecretScanRefusal("invalid scanner stream")
+                    if time.monotonic() >= deadline:
+                        raise SecretScanRefusal(
+                            "scanner output validation timeout")
                     row = strict_json(line)
                     try:
                         location = row["SourceMetadata"]["Data"]["Filesystem"]
@@ -1325,6 +1374,212 @@ def main():
               't; no secret bytes are included.')
         return 1
     return 0
+
+
+def unsupported_archive(prefix, sources):
+    """Refuse recognized archive/compressed blobs, including malformed headers.
+
+    The pinned extractor silently skips some members. Inspect at most the first
+    512 raw bytes and retained original names without decompressing or
+    extracting.
+    Signature-free Brotli and legacy TAR need name/header checks. This is a
+    conservative refusal, never evidence that arbitrary encoded data was
+    decoded.
+
+    Returns:
+        Whether this blob requires separate archive-content qualification.
+    """
+    extensions = {
+        ".7z",
+        ".zip",
+        ".rar",
+        ".tar",
+        ".gz",
+        ".tgz",
+        ".bz2",
+        ".tbz",
+        ".tbz2",
+        ".xz",
+        ".txz",
+        ".lz4",
+        ".lz",
+        ".tlz",
+        ".zst",
+        ".tzst",
+        ".zz",
+        ".zlib",
+        ".br",
+        ".sz",
+        ".s2",
+        ".z",
+        ".ar",
+        ".deb",
+        ".rpm",
+        ".apk",
+        ".jar",
+        ".whl",
+    }
+    if any(
+            Path(source["file"]).suffix.lower() in extensions
+            for source in sources):
+        return True
+    signatures = (
+        b"PK\x03\x04",
+        b"PK\x05\x06",
+        b"PK\x07\x08",
+        b"7z\xbc\xaf\x27\x1c",
+        b"Rar!\x1a\x07\x00",
+        b"Rar!\x1a\x07\x01\x00",
+        b"\x1f\x8b",
+        b"BZh",
+        b"\xfd7zXZ\x00",
+        b"\x04\x22\x4d\x18",
+        b"\x02\x21\x4c\x18",
+        b"LZIP",
+        b"\x28\xb5\x2f\xfd",
+        b"\xff\x06\x00\x00sNaPpY",
+        b"\xff\x06\x00\x00S2sTwO",
+        b"!<arch>\n",
+        b"\xed\xab\xee\xdb",
+        b"070701",
+        b"070702",
+        b"070707",
+        b"\x71\xc7",
+        b"\xc7\x71",
+        b"\x1f\x9d",
+        b"MSCF",
+        b"xar!",
+    )
+    if prefix.startswith(signatures) or prefix[257:262] == b"ustar":
+        return True
+    # Zstandard/LZ4 skippable frames can precede real frames.
+    if len(prefix) >= 4 and 0x50 <= prefix[0] <= 0x5F and prefix[
+            1:4] == b"\x2a\x4d\x18":
+        return True
+    # RFC 1950 DEFLATE headers, including dictionary-bearing variants, have a
+    # checksum.
+    if (len(prefix) >= 2 and prefix[0] & 15 == 8 and prefix[0] >> 4 <= 7
+            and int.from_bytes(prefix[:2], "big") % 31 == 0):
+        return True
+    if len(prefix) >= 512:
+        checksum = prefix[148:156].strip(b"\x00 ")
+        if checksum and all(48 <= value <= 55 for value in checksum):
+            expected = int(checksum, 8)
+            data = prefix[:148] + b" " * 8 + prefix[156:512]
+            # Legacy V7 TAR has no magic; accept both historic checksum
+            # conventions.
+            if expected in {
+                    sum(data),
+                    sum(value if value < 128 else value - 256
+                        for value in data)
+            }:
+                return True
+    return False
+
+
+def valid_lifecycle_diagnostic(row):
+    """Accept only exact v3.99.2 offline filesystem lifecycle log schemas.
+
+    No message is accepted by log level alone, including debug/info skip
+    reports.
+    Extra error fields, incomplete records and unrecognized messages are
+    refused.
+
+    Returns:
+        Whether all fields match a known pinned lifecycle schema.
+    """
+    common = {"level", "ts", "logger", "msg"}
+    if not isinstance(row, dict) or row.get("level") != "info-0" or row.get(
+            "logger") != "trufflehog":
+        return False
+    stamp = row.get("ts")
+    if not isinstance(stamp, str) or not lifecycle_timestamp_shape(stamp):
+        return False
+    try:
+        datetime.fromisoformat(stamp[:-1] +
+                               "+00:00" if stamp.endswith("Z") else stamp)
+    except ValueError:
+        return False
+    if row.get("msg") == "running source":
+        worker = row.get("source_manager_worker_id")
+        return (
+            set(row) == common | {"source_manager_worker_id", "with_units"}
+            and row["with_units"] is True and isinstance(worker, str)
+            and len(worker) == 5
+            and all(c in ('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv'
+                          'wxyz0123456789') for c in worker))
+    counts = {"chunks", "bytes", "verified_secrets", "unverified_secrets"}
+    if row.get("msg") != "finished scanning" or set(row) != common | counts | {
+            "scan_duration",
+            "trufflehog_version",
+            "verification_caching",
+    }:
+        return False
+    if any(type(row[key]) is not int or row[key] < 0 for key in counts):
+        return False
+    duration = row["scan_duration"]
+    if (row["trufflehog_version"] != "3.99.2" or not isinstance(duration, str)
+            or not lifecycle_duration_shape(duration)):
+        return False
+    cache = row["verification_caching"]
+    return (isinstance(cache, dict) and set(cache) == {
+        "Hits", "Misses", "HitsWasted", "AttemptsSaved",
+        "VerificationTimeSpentMS"
+    } and all(type(value) is int and value >= 0 for value in cache.values()))
+
+
+def ascii_decimal(value):
+    """Match an unsigned ASCII decimal with an optional nonempty fractional
+part."""
+    parts = value.split(".")
+    return 1 <= len(parts) <= 2 and all(part and all(c in ('0123456789')
+                                                     for c in part)
+                                        for part in parts)
+
+
+def lifecycle_timestamp_shape(stamp):
+    """Match exactly the frozen ASCII date/time/offset syntax before datetime
+validation."""
+    if stamp.endswith("Z"):
+        local = stamp[:-1]
+    elif len(stamp) >= 6 and stamp[-6] in ('+-') and stamp[-3] == (
+            ':') and all(c in ('0123456789')
+                         for c in stamp[-5:-3] + stamp[-2:]):
+        local = stamp[:-6]
+    else:
+        return False
+    parts = local.split("T")
+    if len(parts) != 2:
+        return False
+    day, clock = parts
+    if len(day) != 10 or day[4] != ('-') or day[7] != ('-') or not all(
+            c in ('0123456789') for c in day[:4] + day[5:7] + day[8:]):
+        return False
+    times = clock.split(".")
+    if len(times) not in (1, 2) or (len(times) == 2 and
+                                    not (times[1] and all(c in ('0123456789')
+                                                          for c in times[1]))):
+        return False
+    clock = times[0]
+    return len(clock) == 8 and clock[2] == (':') and clock[5] == (':') and all(
+        c in ('0123456789') for c in clock[:2] + clock[3:5] + clock[6:])
+
+
+def lifecycle_duration_shape(duration):
+    """Match exactly the frozen unsigned Go-duration lifecycle syntax."""
+    if duration.endswith(("ms", "µs", "ns")):
+        return ascii_decimal(duration[:-2])
+    if not duration.endswith("s"):
+        return False
+    body = duration[:-1]
+    for unit in ("h", "m"):
+        if unit in body:
+            parts = body.split(unit)
+            if len(parts) != 2 or not parts[0] or not all(c in ('0123456789')
+                                                          for c in parts[0]):
+                return False
+            body = parts[1]
+    return ascii_decimal(body)
 
 
 if __name__ == "__main__":
